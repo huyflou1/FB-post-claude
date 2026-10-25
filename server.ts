@@ -5,7 +5,7 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import type { Account, AppState, FbPage, MediaFile, Post, PostInput, ScrapedSort, Settings, TargetResult } from "./shared/types";
 import { addLog, DATA_DIR, flush, getDB, MEDIA_DIR, onChange, save, uid } from "./server/store";
-import { exchangeLongLived, FbError, fetchPages, inspectToken, tokenExpiry } from "./server/facebook";
+import { exchangeCode, exchangeLongLived, FbError, fetchPages, inspectToken, tokenExpiry } from "./server/facebook";
 import { isRunning, postLabel, runPost, startScheduler } from "./server/scheduler";
 import { AiError, generatePosts } from "./server/ai";
 import { addSource, clearUnsaved, fetchSource, importMedia, isFetching, queryScraped, removeSource, ScrapeError, startAutoFetch, updateScraped } from "./server/scraper";
@@ -151,6 +151,59 @@ async function loadFromToken(token: string, previous?: FbPage[]) {
   return { me, pages, expiresAt };
 }
 
+// Adds a nick from a token, or refreshes the nick that token belongs to
+async function connectToken(token: string, label: string, knownExpiry?: string | null) {
+  const db = getDB();
+  const existing = db.accounts.find((a) => a.token === token);
+  const { me, pages, expiresAt: probed } = await loadFromToken(token, existing?.pages);
+  const expiresAt = probed === undefined ? knownExpiry : probed;
+  const same = existing ?? db.accounts.find((a) => a.fbId === me.id && a.status !== "demo");
+
+  if (same) {
+    // A new token for a known nick refreshes it instead of duplicating
+    Object.assign(same, {
+      token,
+      tokenPreview: maskToken(token),
+      name: me.name,
+      picture: me.picture,
+      kind: me.kind,
+      status: "ok",
+      error: undefined,
+      tokenExpiresAt: expiresAt,
+      pages: pages.map((p) => ({ ...p, enabled: same.pages.find((x) => x.id === p.id)?.enabled ?? true })),
+      checkedAt: nowIso(),
+    });
+    if (label) same.label = label;
+    save();
+    addLog("info", `🔑 Đã cập nhật token cho ${me.name} (${pages.length} trang)`);
+    return { acc: same, updated: true };
+  }
+
+  const acc: Account = {
+    id: uid(),
+    fbId: me.id,
+    name: me.name,
+    label,
+    picture: me.picture,
+    kind: me.kind,
+    status: "ok",
+    color: ACCOUNT_COLORS[db.accounts.length % ACCOUNT_COLORS.length],
+    token,
+    tokenPreview: maskToken(token),
+    tokenExpiresAt: expiresAt,
+    pages,
+    addedAt: nowIso(),
+    checkedAt: nowIso(),
+  };
+  db.accounts.push(acc);
+  save();
+  addLog("info", `👤 Đã thêm ${acc.name} với ${pages.length} trang`);
+  if (me.kind === "user" && pages.length === 0) {
+    addLog("warn", `${acc.name} chưa có trang nào. Hãy cấp quyền pages_show_list, pages_manage_posts và chọn các trang khi đăng nhập.`);
+  }
+  return { acc, updated: false };
+}
+
 app.post(
   "/api/accounts",
   h(async (req, res) => {
@@ -158,64 +211,97 @@ app.post(
     const label = String(req.body?.label ?? "").trim();
     if (!token) throw new HttpError(400, "Hãy dán access token");
 
-    const db = getDB();
     if (token.toLowerCase() === "demo") {
       const acc = demoAccount();
       if (label) acc.label = label;
-      db.accounts.push(acc);
+      getDB().accounts.push(acc);
       addLog("info", `👤 Đã thêm ${acc.name} (demo) với ${acc.pages.length} trang`);
       return res.json(publicAccount(acc));
     }
-
-    const existing = db.accounts.find((a) => a.token === token);
-    const { me, pages, expiresAt } = await loadFromToken(token, existing?.pages);
-    const same = existing ?? db.accounts.find((a) => a.fbId === me.id && a.status !== "demo");
-
-    if (same) {
-      // Pasting a new token for a known nick refreshes it instead of duplicating
-      Object.assign(same, {
-        token,
-        tokenPreview: maskToken(token),
-        name: me.name,
-        picture: me.picture,
-        kind: me.kind,
-        status: "ok",
-        error: undefined,
-        tokenExpiresAt: expiresAt,
-        pages: pages.map((p) => ({ ...p, enabled: same.pages.find((x) => x.id === p.id)?.enabled ?? true })),
-        checkedAt: nowIso(),
-      });
-      if (label) same.label = label;
-      save();
-      addLog("info", `🔑 Đã cập nhật token cho ${me.name} (${pages.length} trang)`);
-      return res.json(publicAccount(same));
-    }
-
-    const acc: Account = {
-      id: uid(),
-      fbId: me.id,
-      name: me.name,
-      label,
-      picture: me.picture,
-      kind: me.kind,
-      status: "ok",
-      color: ACCOUNT_COLORS[db.accounts.length % ACCOUNT_COLORS.length],
-      token,
-      tokenPreview: maskToken(token),
-      tokenExpiresAt: expiresAt,
-      pages,
-      addedAt: nowIso(),
-      checkedAt: nowIso(),
-    };
-    db.accounts.push(acc);
-    save();
-    addLog("info", `👤 Đã thêm ${acc.name} với ${pages.length} trang`);
-    if (me.kind === "user" && pages.length === 0) {
-      addLog("warn", `${acc.name} chưa có trang nào. Token cần quyền pages_show_list và pages_manage_posts.`);
-    }
+    const { acc } = await connectToken(token, label);
     res.json(publicAccount(acc));
   }),
 );
+
+// ---------- Facebook Login (OAuth) ----------
+// The user signs in on facebook.com itself; the app only receives a one-time
+// code, which the server swaps for a token using the App ID + App Secret.
+
+const OAUTH_SCOPES = ["pages_show_list", "pages_read_engagement", "pages_manage_posts", "business_management"];
+const oauthStates = new Map<string, { expires: number; label: string; redirectUri: string }>();
+
+function redirectUriFor(req: Request) {
+  // Only trust local hosts; anything else falls back to the canonical address
+  const host = req.get("host") ?? "";
+  const safe = /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host) ? host : `localhost:${PORT}`;
+  return `http://${safe}/auth/facebook/callback`;
+}
+
+app.get("/api/auth/facebook/info", (req, res) => {
+  const s = getDB().settings;
+  res.json({ ready: !!(s.appId && s.appSecret), redirectUri: redirectUriFor(req), scopes: OAUTH_SCOPES });
+});
+
+app.get("/auth/facebook/start", (req, res) => {
+  const s = getDB().settings;
+  if (!s.appId || !s.appSecret) return res.status(400).send(oauthPage(false, "Chưa nhập App ID và App Secret."));
+  const now = Date.now();
+  for (const [k, v] of oauthStates) if (v.expires < now) oauthStates.delete(k);
+  const state = uid() + uid();
+  const redirectUri = redirectUriFor(req);
+  oauthStates.set(state, { expires: now + 10 * 60_000, label: String(req.query.label ?? "").slice(0, 60), redirectUri });
+  const q = new URLSearchParams({
+    client_id: s.appId,
+    redirect_uri: redirectUri,
+    state,
+    response_type: "code",
+    scope: OAUTH_SCOPES.join(","),
+    // Re-asks permissions the user skipped last time
+    auth_type: "rerequest",
+  });
+  res.redirect(`https://www.facebook.com/${s.graphVersion}/dialog/oauth?${q}`);
+});
+
+app.get("/auth/facebook/callback", async (req, res) => {
+  const state = String(req.query.state ?? "");
+  const entry = oauthStates.get(state);
+  oauthStates.delete(state);
+  if (!entry || entry.expires < Date.now()) return res.send(oauthPage(false, "Phiên đăng nhập đã hết hạn, hãy bấm Đăng nhập lại."));
+  if (req.query.error) {
+    const denied = req.query.error_reason === "user_denied";
+    return res.send(oauthPage(false, denied ? "Bạn đã huỷ đăng nhập." : String(req.query.error_description ?? req.query.error)));
+  }
+  const code = String(req.query.code ?? "");
+  if (!code) return res.send(oauthPage(false, "Facebook không trả về mã đăng nhập."));
+
+  const { appId, appSecret, graphVersion } = getDB().settings;
+  try {
+    const short = await exchangeCode(code, appId, appSecret, entry.redirectUri, graphVersion);
+    // Long-lived user token, so the page tokens fetched from it do not expire
+    const long = await exchangeLongLived(short, appId, appSecret, graphVersion);
+    const { acc, updated } = await connectToken(long.token, entry.label, long.expiresAt);
+    res.send(oauthPage(true, `${updated ? "Đã cập nhật" : "Đã kết nối"} ${acc.name} · ${acc.pages.length} trang`));
+  } catch (e: any) {
+    addLog("error", `Đăng nhập Facebook lỗi: ${e?.message ?? e}`);
+    res.send(oauthPage(false, e?.message ?? String(e)));
+  }
+});
+
+function escapeHtml(t: string) {
+  return t.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+// Shown in the login popup: tells the app what happened, then closes itself
+function oauthPage(ok: boolean, message: string) {
+  const payload = JSON.stringify({ type: "fb-login", ok, message }).replace(/</g, "\\u003c");
+  const after = ok ? "setTimeout(function(){window.close()},900);" : "";
+  const fallback = ok ? 'setTimeout(function(){location.replace("/#accounts")},1200);' : "";
+  return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Đăng nhập Facebook</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font-family:system-ui,"Segoe UI",sans-serif;background:#f4f2fb;color:#2a2540}
+.c{background:#fff;border-radius:24px;padding:32px;max-width:360px;text-align:center;box-shadow:0 8px 30px rgba(60,48,120,.12)}.e{font-size:48px}p{color:#6e6888;font-size:14px}a{color:#4a68e0;font-weight:700}</style></head>
+<body><div class="c"><div class="e">${ok ? "🎉" : "😿"}</div><h2>${ok ? "Đăng nhập thành công" : "Chưa đăng nhập được"}</h2><p>${escapeHtml(message)}</p><p><a href="/#accounts">Quay lại app</a></p></div>
+<script>try{if(window.opener){window.opener.postMessage(${payload},location.origin);${after}}else{${fallback}}}catch(e){}</script></body></html>`;
+}
 
 app.post(
   "/api/accounts/:id/refresh",

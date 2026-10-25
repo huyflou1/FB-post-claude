@@ -91,6 +91,13 @@ export async function tokenExpiry(token: string, v: string): Promise<string | nu
   }
 }
 
+// Facebook Login: swap the one-time code from the dialog for a short-lived user token
+export async function exchangeCode(code: string, appId: string, appSecret: string, redirectUri: string, v: string) {
+  const q = new URLSearchParams({ client_id: appId, client_secret: appSecret, redirect_uri: redirectUri, code });
+  const r: any = await graph(`${base(v)}/oauth/access_token?${q}`);
+  return r.access_token as string;
+}
+
 export async function exchangeLongLived(token: string, appId: string, appSecret: string, v: string) {
   const q = new URLSearchParams({
     grant_type: "fb_exchange_token",

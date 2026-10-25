@@ -1,21 +1,225 @@
-import React, { useState } from "react";
-import { Eye, EyeOff, Hourglass, Plus, RefreshCw, Trash2 } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { Check, Copy, Eye, EyeOff, Hourglass, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
 import type { Account } from "../../shared/types";
 import { api, fmtDateTime, fmtRelative, useApp } from "../lib";
-import { Avatar, Badge, Block, Button, Emo, EmptyState, IconButton, inputCls, Label, Toggle } from "../components/ui";
+import { Avatar, Badge, Block, Button, Emo, EmptyState, IconButton, inputCls, Toggle } from "../components/ui";
 
-function AddAccount() {
+interface LoginInfo {
+  ready: boolean;
+  redirectUri: string;
+  scopes: string[];
+}
+
+function FbLogo({ className = "w-5 h-5" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden fill="currentColor">
+      <path d="M24 12.07C24 5.4 18.63 0 12 0S0 5.4 0 12.07C0 18.1 4.39 23.1 10.13 24v-8.44H7.08v-3.49h3.05V9.41c0-3.02 1.79-4.69 4.53-4.69 1.31 0 2.68.24 2.68.24v2.97h-1.51c-1.49 0-1.96.93-1.96 1.89v2.25h3.33l-.53 3.49h-2.8V24C19.61 23.1 24 18.1 24 12.07z" />
+    </svg>
+  );
+}
+
+function CopyField({ value }: { value: string }) {
+  const [done, setDone] = useState(false);
+  return (
+    <div className="flex gap-1.5">
+      <code className="flex-1 min-w-0 truncate bg-field border border-line rounded-xl px-3 py-2 text-[12px] font-mono text-ink">{value}</code>
+      <Button
+        size="sm"
+        variant="soft"
+        className="h-auto"
+        icon={done ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(value);
+            setDone(true);
+            setTimeout(() => setDone(false), 1500);
+          } catch {
+            /* clipboard blocked: the text is still selectable */
+          }
+        }}
+      >
+        {done ? "Đã chép" : "Chép"}
+      </Button>
+    </div>
+  );
+}
+
+// Step-by-step setup of the user's own Facebook App, shown until App ID + Secret are saved
+function AppSetup({ info, onSaved }: { info: LoginInfo; onSaved: () => void }) {
+  const { run } = useApp();
+  const [appId, setAppId] = useState("");
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setBusy(true);
+    const ok = await run(() => api.put("/api/settings", { appId, appSecret: secret }), "Đã lưu App, giờ có thể đăng nhập");
+    setBusy(false);
+    if (ok) onSaved();
+  };
+
+  const steps: [string, string, React.ReactNode][] = [
+    [
+      "🧩",
+      "Tạo App Facebook (làm 1 lần)",
+      <>
+        Vào{" "}
+        <a className="text-brand-ink font-bold hover:underline" href="https://developers.facebook.com/apps/creation/" target="_blank" rel="noreferrer">
+          developers.facebook.com/apps
+        </a>{" "}
+        → Tạo ứng dụng, chọn mục đích quản lý Trang (loại Business).
+      </>,
+    ],
+    [
+      "🔗",
+      "Bật Facebook Login",
+      <>
+        Thêm sản phẩm <b>Facebook Login</b> → Cài đặt → dán địa chỉ này vào <b>Valid OAuth Redirect URIs</b>:
+        <span className="block mt-1.5">
+          <CopyField value={info.redirectUri} />
+        </span>
+      </>,
+    ],
+    ["🔑", "Nhập App ID và App Secret", <>Lấy ở Cài đặt ứng dụng → Thông tin cơ bản.</>],
+  ];
+
+  return (
+    <div className="space-y-3">
+      <ol className="space-y-2">
+        {steps.map(([e, t, d], i) => (
+          <li key={i} className="flex gap-3 rounded-2xl bg-raised border border-line p-3">
+            <Emo e={e} tone="blue" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-extrabold text-ink">
+                {i + 1}. {t}
+              </p>
+              <div className="text-xs text-soft mt-0.5 leading-relaxed">{d}</div>
+            </div>
+          </li>
+        ))}
+      </ol>
+      <div className="grid sm:grid-cols-2 gap-2">
+        <input value={appId} onChange={(e) => setAppId(e.target.value)} placeholder="App ID" className={`${inputCls} font-mono text-[13px]`} aria-label="App ID" autoComplete="off" />
+        <input type="password" value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="App Secret" className={`${inputCls} font-mono text-[13px]`} aria-label="App Secret" autoComplete="off" />
+      </div>
+      <Button variant="primary" className="w-full" onClick={save} loading={busy} disabled={!appId.trim() || !secret.trim()}>
+        Lưu và bật đăng nhập Facebook
+      </Button>
+    </div>
+  );
+}
+
+function FacebookLogin() {
+  const { run, toast, refresh, state } = useApp();
+  const [info, setInfo] = useState<LoginInfo | null>(null);
+  const [label, setLabel] = useState("");
+  const [waiting, setWaiting] = useState(false);
+  const [demoBusy, setDemoBusy] = useState(false);
+  const popup = useRef<Window | null>(null);
+
+  const loadInfo = useCallback(() => {
+    api.get<LoginInfo>("/api/auth/facebook/info").then(setInfo, () => {});
+  }, []);
+  // Settings saved elsewhere (Cài đặt) also unlock the button
+  useEffect(loadInfo, [loadInfo, state.settings.appId, state.settings.hasAppSecret]);
+
+  // The popup reports back through postMessage when Facebook sends the user home
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      if (e.origin !== location.origin || e.data?.type !== "fb-login") return;
+      setWaiting(false);
+      toast(e.data.message, e.data.ok ? "ok" : "err", e.data.ok ? "🎉" : "😿");
+      if (e.data.ok) {
+        setLabel("");
+        refresh();
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [toast, refresh]);
+
+  // Closing the popup without finishing should not leave the button spinning
+  useEffect(() => {
+    if (!waiting) return;
+    const t = window.setInterval(() => {
+      if (popup.current?.closed) setWaiting(false);
+    }, 700);
+    return () => window.clearInterval(t);
+  }, [waiting]);
+
+  const login = () => {
+    const url = `/auth/facebook/start?label=${encodeURIComponent(label.trim())}`;
+    const w = 600;
+    const h = 720;
+    const left = window.screenX + (window.outerWidth - w) / 2;
+    const top = window.screenY + (window.outerHeight - h) / 2;
+    popup.current = window.open(url, "fb-login", `width=${w},height=${h},left=${left},top=${top}`);
+    // Popup blocked: go through the same flow in this tab
+    if (!popup.current) location.href = url;
+    else setWaiting(true);
+  };
+
+  const addDemo = async () => {
+    setDemoBusy(true);
+    const acc = await run(() => api.post<Account>("/api/accounts", { token: "demo" }));
+    setDemoBusy(false);
+    if (acc) toast(`Đã thêm ${acc.name} · ${acc.pages.length} trang`);
+  };
+
+  return (
+    <Block emoji="🔐" tone="blue" title="Đăng nhập Facebook" subtitle="Đăng nhập trên trang của Facebook, app không thấy mật khẩu">
+      {!info ? (
+        <div className="h-24 rounded-2xl bg-field animate-pulse" />
+      ) : info.ready ? (
+        <div className="space-y-3">
+          <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Ghi chú cho nick (tuỳ chọn), VD: Nick bán hàng" className={inputCls} aria-label="Ghi chú cho nick" />
+          <button
+            type="button"
+            onClick={login}
+            disabled={waiting}
+            className="w-full h-12 rounded-2xl bg-[#1877F2] hover:bg-[#166fe5] active:bg-[#1464d0] text-white font-extrabold text-[15px] flex items-center justify-center gap-2.5 shadow-[0_8px_20px_-8px_#1877F2] transition focus-ring disabled:opacity-80"
+          >
+            {waiting ? <Loader2 className="w-5 h-5 animate-spin" /> : <FbLogo />}
+            {waiting ? "Đang chờ bạn đăng nhập trong cửa sổ Facebook…" : "Đăng nhập bằng Facebook"}
+          </button>
+          <ul className="text-[12px] text-soft font-semibold space-y-1.5 leading-relaxed">
+            <li>
+              <span className="emoji">✅</span> Khi Facebook hỏi, hãy <b>chọn các Trang</b> muốn đăng bài và cho phép mọi quyền.
+            </li>
+            <li>
+              <span className="emoji">👥</span> Thêm nick khác: trong cửa sổ Facebook chọn <b>Đăng nhập tài khoản khác</b> (hoặc đăng xuất Facebook trước).
+            </li>
+            <li>
+              <span className="emoji">🧪</span> App đang ở chế độ Development thì chỉ nick có vai trò trong App (Admin, Developer, Tester) đăng nhập được.
+            </li>
+          </ul>
+        </div>
+      ) : (
+        <AppSetup info={info} onSaved={loadInfo} />
+      )}
+      <div className="flex items-center gap-2 mt-4 pt-3 border-t border-line">
+        <span className="text-[11px] text-faint font-semibold flex-1">Chưa sẵn sàng? Thử app với dữ liệu giả lập trước.</span>
+        <Button size="sm" variant="ghost" onClick={addDemo} loading={demoBusy}>
+          <span className="emoji">✨</span> Thêm nick demo
+        </Button>
+      </div>
+    </Block>
+  );
+}
+
+// Fallback for people who already have a token (Graph API Explorer, other tools)
+function TokenLogin() {
   const { run, toast } = useApp();
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("");
   const [show, setShow] = useState(false);
-  const [busy, setBusy] = useState<"" | "real" | "demo">("");
+  const [busy, setBusy] = useState(false);
 
-  const add = async (demo = false) => {
-    if (!demo && !token.trim()) return;
-    setBusy(demo ? "demo" : "real");
-    const acc = await run(() => api.post<Account>("/api/accounts", { token: demo ? "demo" : token, label }));
-    setBusy("");
+  const add = async () => {
+    if (!token.trim()) return;
+    setBusy(true);
+    const acc = await run(() => api.post<Account>("/api/accounts", { token, label }));
+    setBusy(false);
     if (acc) {
       setToken("");
       setLabel("");
@@ -24,72 +228,41 @@ function AddAccount() {
   };
 
   return (
-    <Block emoji="🔌" tone="mint" title="Kết nối nick mới" subtitle="Mỗi nick dùng một access token riêng">
-      <div className="grid md:grid-cols-[minmax(0,1fr)_220px] gap-3">
-        <div>
-          <Label htmlFor="token">Access token</Label>
-          <div className="relative">
-            <input
-              id="token"
-              type={show ? "text" : "password"}
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && add()}
-              placeholder="EAAG… (token người dùng hoặc token trang)"
-              className={`${inputCls} pr-11 font-mono text-[13px]`}
-              autoComplete="off"
-              spellCheck={false}
-            />
-            <IconButton label={show ? "Ẩn token" : "Hiện token"} className="absolute right-1.5 top-1/2 -translate-y-1/2" onClick={() => setShow((v) => !v)}>
-              {show ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-            </IconButton>
-          </div>
+    <Block emoji="🗝️" tone="lemon" title="Cách khác: dán access token" subtitle="Dành cho ai đã có sẵn token" collapsible defaultOpen={false}>
+      <div className="space-y-3">
+        <div className="relative">
+          <input
+            type={show ? "text" : "password"}
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && add()}
+            placeholder="EAAG… (token người dùng hoặc token trang)"
+            className={`${inputCls} pr-11 font-mono text-[13px]`}
+            autoComplete="off"
+            spellCheck={false}
+            aria-label="Access token"
+          />
+          <IconButton label={show ? "Ẩn token" : "Hiện token"} className="absolute right-1.5 top-1/2 -translate-y-1/2" onClick={() => setShow((v) => !v)}>
+            {show ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+          </IconButton>
         </div>
-        <div>
-          <Label htmlFor="label" hint="tuỳ chọn">
-            Ghi chú
-          </Label>
-          <input id="label" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="VD: Nick bán hàng" className={inputCls} />
+        <div className="flex gap-2">
+          <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Ghi chú (tuỳ chọn)" className={inputCls} aria-label="Ghi chú" />
+          <Button variant="primary" icon={<Plus className="w-4 h-4" />} onClick={add} loading={busy} disabled={!token.trim()}>
+            Kết nối
+          </Button>
         </div>
+        <p className="text-xs text-soft leading-relaxed">
+          Lấy token ở{" "}
+          <a className="text-brand-ink font-bold hover:underline" href="https://developers.facebook.com/tools/explorer/" target="_blank" rel="noreferrer">
+            Graph API Explorer
+          </a>
+          : chọn App, tích <code className="font-bold">pages_show_list</code>, <code className="font-bold">pages_read_engagement</code>, <code className="font-bold">pages_manage_posts</code> rồi bấm Generate Access Token. Dán token mới của nick đã có sẽ cập nhật nick đó.
+        </p>
+        <p className="text-xs text-soft leading-relaxed">
+          <span className="emoji">ℹ️</span> Facebook chỉ cho ứng dụng đăng lên <b>Trang (Fanpage)</b> mà nick quản lý. Trang cá nhân và nhóm không đăng được qua API chính thức.
+        </p>
       </div>
-      <div className="flex flex-wrap gap-2 mt-3">
-        <Button variant="primary" icon={<Plus className="w-4 h-4" />} onClick={() => add()} loading={busy === "real"} disabled={!token.trim() || !!busy}>
-          Kết nối
-        </Button>
-        <Button variant="soft" onClick={() => add(true)} loading={busy === "demo"} disabled={!!busy}>
-          <span className="emoji">✨</span> Thêm nick demo để dùng thử
-        </Button>
-      </div>
-      <p className="text-[11px] text-faint font-semibold mt-3">Dán token mới của một nick đã có sẽ cập nhật nick đó, không tạo trùng. Token chỉ lưu trên máy này.</p>
-    </Block>
-  );
-}
-
-function Guide() {
-  const steps = [
-    ["🧑‍💻", "Mở Graph API Explorer", <>Vào <a className="text-brand-ink font-bold hover:underline" href="https://developers.facebook.com/tools/explorer/" target="_blank" rel="noreferrer">developers.facebook.com/tools/explorer</a> và chọn App của bạn.</>],
-    ["✅", "Thêm quyền", <>Tích <code className="font-bold">pages_show_list</code>, <code className="font-bold">pages_read_engagement</code>, <code className="font-bold">pages_manage_posts</code>.</>],
-    ["🔑", "Tạo token", <>Bấm <b>Generate Access Token</b>, đăng nhập nick cần dùng, chọn các trang cho phép rồi copy token.</>],
-    ["⏳", "Gia hạn (nên làm)", <>Nhập App ID + App Secret ở Cài đặt, rồi bấm <b>Gia hạn</b> trên thẻ nick: token trang sẽ không hết hạn.</>],
-  ] as const;
-  return (
-    <Block emoji="🗺️" tone="lemon" title="Lấy token ở đâu?" subtitle="4 bước, làm một lần cho mỗi nick" collapsible defaultOpen={false}>
-      <ol className="grid sm:grid-cols-2 gap-3">
-        {steps.map(([e, t, d], i) => (
-          <li key={i} className="flex gap-3 rounded-2xl bg-raised border border-line p-3">
-            <Emo e={e} tone="lemon" />
-            <div className="min-w-0">
-              <p className="text-sm font-extrabold text-ink">
-                {i + 1}. {t}
-              </p>
-              <p className="text-xs text-soft mt-0.5 leading-relaxed">{d}</p>
-            </div>
-          </li>
-        ))}
-      </ol>
-      <p className="text-xs text-soft mt-3 leading-relaxed">
-        <span className="emoji">ℹ️</span> Facebook chỉ cho phép ứng dụng đăng lên <b>Trang (Fanpage)</b> mà nick đó quản lý. Trang cá nhân và nhóm không đăng được qua API chính thức.
-      </p>
     </Block>
   );
 }
@@ -191,12 +364,12 @@ export default function Accounts() {
   return (
     <div className="space-y-4 sm:space-y-5">
       <div className="grid lg:grid-cols-2 gap-4 sm:gap-5 items-start">
-        <AddAccount />
-        <Guide />
+        <FacebookLogin />
+        <TokenLogin />
       </div>
       {state.accounts.length === 0 ? (
         <Block>
-          <EmptyState emoji="🐥" tone="mint" title="Chưa có nick nào" text="Dán access token ở trên, hoặc thêm nick demo để xem app hoạt động thế nào." />
+          <EmptyState emoji="🐥" tone="mint" title="Chưa có nick nào" text="Bấm Đăng nhập bằng Facebook ở trên, hoặc thêm nick demo để xem app hoạt động thế nào." />
         </Block>
       ) : (
         <ul className="grid md:grid-cols-2 2xl:grid-cols-3 gap-4 sm:gap-5 items-start">

@@ -51,7 +51,7 @@ export default function SettingsPage() {
         </div>
       </Block>
 
-      <Block emoji="🧩" tone="blue" title="Facebook App" subtitle="Cần để đổi token sang loại dài hạn">
+      <Block emoji="🧩" tone="blue" title="Facebook App" subtitle="Cần để đăng nhập Facebook và gia hạn token">
         <div className="space-y-4">
           <div>
             <Label htmlFor="app-id">App ID</Label>
