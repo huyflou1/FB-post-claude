@@ -1,0 +1,8 @@
+node_modules/
+storage/
+dist/
+dist-server/
+*.log
+.claude/
+.env*
+*.tmp
